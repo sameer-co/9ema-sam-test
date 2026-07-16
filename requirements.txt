@@ -4,3 +4,4 @@ numpy
 pandas-ta
 backtesting
 bokeh
+ccxt
