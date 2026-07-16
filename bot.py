@@ -62,7 +62,6 @@ def fetch_binance_1m_data(symbol="SOLUSDT", limit_days=365):
     print(f"\nSuccessfully downloaded {len(all_candles)} candles.")
     
     # Construct DataFrame from raw Binance structure
-    # Binance index map: 0=Open Time, 1=Open, 2=High, 3=Low, 4=Close, 5=Volume
     df = pd.DataFrame(all_candles, columns=[
         'OpenTime', 'Open', 'High', 'Low', 'Close', 'Volume',
         'CloseTime', 'QuoteVolume', 'Trades', 'TakerBase', 'TakerQuote', 'Ignore'
@@ -84,15 +83,17 @@ def fetch_binance_1m_data(symbol="SOLUSDT", limit_days=365):
 # =====================================================================
 class SolEmaSmaStrategy(Strategy):
     def init(self):
-        close_series = pd.Series(self.data.Close)
+        # Extract the proper series wrapper using .s property to ensure compatibility with pandas_ta
+        close_series = pd.Series(self.data.Close.s)
         
         # 1. Calculate 9-period EMA
-        self.ema9 = self.I(ta.ema, close_series, length=9)
+        self.ema9 = self.I(lambda: ta.ema(close_series, length=9))
         
-        # 2. Calculate the Smoothed 9 SMA (SMA of the 9 EMA)
-        self.sma9_of_ema = self.I(lambda x: ta.sma(pd.Series(x), length=9), self.ema9)
+        # 2. Calculate the Smoothed 9 SMA (SMA of the computed 9 EMA)
+        self.sma9_of_ema = self.I(lambda: ta.sma(pd.Series(self.ema9), length=9))
 
     def next(self):
+        # Ensure we have enough data history warm-up to run indicator calculations
         if len(self.data) < 18:
             return
 
@@ -105,7 +106,6 @@ class SolEmaSmaStrategy(Strategy):
                 
                 # Stop Loss is set below the low of the entry candle
                 stop_loss = entry_low
-                
                 risk = entry_price - entry_low
                 
                 # Dynamic fallback buffer if entry low is equal to entry close
@@ -116,19 +116,20 @@ class SolEmaSmaStrategy(Strategy):
                 # Target is exactly 2x the distance of the risk profile
                 take_profit = entry_price + (2 * risk)
                 
-                self.buy(sl=stop_loss, tp=take_profit)
+                # Fixed: Sizing set to 0.95 (95% cash) provides a buffer for commission costs
+                # to completely bypass order rejection warnings.
+                self.buy(size=0.95, sl=stop_loss, tp=take_profit)
 
 
 # =====================================================================
 # 3. RUN STRATEGY PIPELINE
 # =====================================================================
 if __name__ == "__main__":
-    # Fetch 1 year of 1-minute historical data (365 days)
-    # Note: For faster testing runs you can reduce limit_days to 30 or 90.
+    # Fetch data (Change limit_days=5 or 10 if you want a fast validation run)
     df = fetch_binance_1m_data(symbol="SOLUSDT", limit_days=365)
     
     # Execute Backtest starting with $10,000 cash and 0.075% taker fee/commission
-    bt = Backtest(df, SolEmaSmaStrategy, cash=10000, commission=0.00075)
+    bt = Backtest(df, SolEmaSmaStrategy, cash=10000, commission=0.00075, hedging=False, exclusive_orders=True)
     stats = bt.run()
     
     # Print Exact Requested Metrics
@@ -136,7 +137,7 @@ if __name__ == "__main__":
     print("             BACKTEST METRICS            ")
     print("="*40)
     print(f"Total Trades Taken : {stats['# Trades']}")
-    print(f"Winning Trades (%) : {stats['Win Rate [%]']:.2f}%")
+    print(f"Winning Trades (%) : {stats['Win Rate [%]']:.2f}%" if not pd.isna(stats['Win Rate [%]']) else "Winning Trades (%) : 0.00%")
     print(f"Starting Capital   : ${stats['Equity Start [$]']:.2f}")
     print(f"Ending Capital     : ${stats['Equity Final [$]']:.2f}")
     print(f"Net Profit/Loss ($): ${stats['Return [$]']:.2f}")
@@ -148,9 +149,8 @@ if __name__ == "__main__":
     print("\n--- Trade Execution Log (Buy Only) ---")
     trades = stats['_trades']
     if not trades.empty:
-        trades['P&L ($)'] = (trades['ExitPrice'] - trades['EntryPrice']) * trades['Size']
-        # Show key trade properties
+        # Fixed: backtesting.py native column handles absolute PnL natively via 'PnL' column
         pd.set_option('display.max_rows', 100)
-        print(trades[['EntryTime', 'ExitTime', 'EntryPrice', 'ExitPrice', 'P&L ($)', 'ReturnPct']])
+        print(trades[['EntryTime', 'ExitTime', 'EntryPrice', 'ExitPrice', 'PnL', 'ReturnPct']])
     else:
         print("No completed trades matched your strategy's entry execution rules.")
