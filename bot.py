@@ -8,18 +8,31 @@ from backtesting import Backtest, Strategy
 from backtesting.lib import crossover
 
 # =====================================================================
-# 1. LIVE BINANCE DATA FETCH FUNCTION (NO API KEY REQUIRED)
+# 1. DECOUPLED INDICATOR HELPER FUNCTIONS
+# =====================================================================
+def compute_ema(series, length):
+    """Calculates clean standard EMA series."""
+    return ta.ema(series, length=length)
+
+def compute_sma_of_ema(series, ema_length, sma_length):
+    """Calculates EMA first, then applies SMA smoothing to it cleanly."""
+    ema = ta.ema(series, length=ema_length)
+    return ta.sma(ema, length=sma_length)
+
+
+# =====================================================================
+# 2. HISTORICAL BINANCE DATA EXTRACTION (NO API KEYS REQUIRED)
 # =====================================================================
 def fetch_binance_1m_data(symbol="SOLUSDT", limit_days=365):
     """
-    Fetches historical 1-minute candle data from the public Binance API 
-    for the specified number of days up to the current moment.
+    Fetches historical 1-minute candle data directly from the public Binance API 
+    for the specified number of days up to the current timestamp.
     """
     print(f"Fetching {limit_days} days of 1-minute historical data for {symbol} from Binance...")
     
     base_url = "https://api.binance.com/api/v3/klines"
     
-    # Define start and end times in milliseconds
+    # Define time windows in milliseconds
     end_time = int(time.time() * 1000)
     start_time = end_time - (limit_days * 24 * 60 * 60 * 1000)
     
@@ -32,7 +45,7 @@ def fetch_binance_1m_data(symbol="SOLUSDT", limit_days=365):
             "interval": "1m",
             "startTime": current_start,
             "endTime": end_time,
-            "limit": 1000 # Maximum candles allowed per single request
+            "limit": 1000  # Max chunk size supported by Binance public klines
         }
         
         try:
@@ -40,7 +53,7 @@ def fetch_binance_1m_data(symbol="SOLUSDT", limit_days=365):
             response.raise_for_status()
             data = response.json()
         except Exception as e:
-            print(f"Error fetching data: {e}")
+            print(f"Error fetching data batch: {e}")
             break
             
         if not data:
@@ -48,30 +61,30 @@ def fetch_binance_1m_data(symbol="SOLUSDT", limit_days=365):
             
         all_candles.extend(data)
         
-        # The last candle's open time is used to offset the next batch forward
+        # Shift time context forward using the open time of the final candle in the array
         last_candle_time = data[-1][0]
-        current_start = last_candle_time + 60000 # Add 1 minute in milliseconds
+        current_start = last_candle_time + 60000  # Add 1 minute offset
         
-        # Provide user feedback to track download progress
+        # Display explicit download track status
         progress_pct = min(100.0, ((current_start - start_time) / (end_time - start_time)) * 100)
         print(f"Downloaded up to {datetime.datetime.fromtimestamp(last_candle_time/1000).strftime('%Y-%m-%d %H:%M:%S')} ({progress_pct:.2f}%)", end="\r")
         
-        # Slight pause to respect public endpoint rate limiting
+        # Anti-rate-limiting pause
         time.sleep(0.1)
         
     print(f"\nSuccessfully downloaded {len(all_candles)} candles.")
     
-    # Construct DataFrame from raw Binance structure
+    # Map fields to match raw Binance structural arrays
     df = pd.DataFrame(all_candles, columns=[
         'OpenTime', 'Open', 'High', 'Low', 'Close', 'Volume',
         'CloseTime', 'QuoteVolume', 'Trades', 'TakerBase', 'TakerQuote', 'Ignore'
     ])
     
-    # Process types and convert timestamps to readable Index
+    # Set readable Timestamp indexing
     df['Date'] = pd.to_datetime(df['OpenTime'], unit='ms')
     df.set_index('Date', inplace=True)
     
-    # Convert numerical columns from strings to float format
+    # Cast target pricing tracks into float structures
     for col in ['Open', 'High', 'Low', 'Close', 'Volume']:
         df[col] = df[col].astype(float)
         
@@ -79,60 +92,67 @@ def fetch_binance_1m_data(symbol="SOLUSDT", limit_days=365):
 
 
 # =====================================================================
-# 2. DEFINE THE 9 EMA / 9 SMA CROSSOVER STRATEGY (BUY-ONLY)
+# 3. STRATEGY ENGINE DEFINITION (9 EMA / 9 SMA SYSTEM)
 # =====================================================================
 class SolEmaSmaStrategy(Strategy):
     def init(self):
-        # Extract the proper series wrapper using .s property to ensure compatibility with pandas_ta
+        # Safely capture the primary raw series array layout using the internal .s wrapper
         close_series = pd.Series(self.data.Close.s)
         
-        # 1. Calculate 9-period EMA
-        self.ema9 = self.I(lambda: ta.ema(close_series, length=9))
-        
-        # 2. Calculate the Smoothed 9 SMA (SMA of the computed 9 EMA)
-        self.sma9_of_ema = self.I(lambda: ta.sma(pd.Series(self.ema9), length=9))
+        # Register indicators safely via standard element arrays to prevent internal indexing conflicts
+        self.ema9 = self.I(compute_ema, close_series, 9)
+        self.sma9_of_ema = self.I(compute_sma_of_ema, close_series, 9, 9)
 
     def next(self):
-        # Ensure we have enough data history warm-up to run indicator calculations
+        # Warmup gap check to accommodate indicator resolution ranges
         if len(self.data) < 18:
             return
 
-        # Buy-only execution model
+        # Buy-Only Strategy Model execution rules
         if not self.position:
-            # Entry condition: 9 EMA crosses above its 9 SMA smoothed line
+            # Entry Logic: Trigger order if the 9 EMA crosses above the smoothed SMA line
             if crossover(self.ema9, self.sma9_of_ema):
                 entry_price = self.data.Close[-1]
                 entry_low = self.data.Low[-1]
                 
-                # Stop Loss is set below the low of the entry candle
+                # Dynamic Bracket setup using candle metrics
                 stop_loss = entry_low
                 risk = entry_price - entry_low
                 
-                # Dynamic fallback buffer if entry low is equal to entry close
+                # Protection fallback logic if low matches current close pricing
                 if risk <= 0:
                     risk = entry_price * 0.001
                     stop_loss = entry_price - risk
                 
-                # Target is exactly 2x the distance of the risk profile
+                # Take profit set at standard double risk scale
                 take_profit = entry_price + (2 * risk)
                 
-                # Fixed: Sizing set to 0.95 (95% cash) provides a buffer for commission costs
-                # to completely bypass order rejection warnings.
+                # Sizing set to 0.95 allocates 95% of equity, leaving a 5% margin safety 
+                # cushion to naturally pay for exchange taker commission fees without order rejections
                 self.buy(size=0.95, sl=stop_loss, tp=take_profit)
 
 
 # =====================================================================
-# 3. RUN STRATEGY PIPELINE
+# 4. EXECUTION PIPELINE
 # =====================================================================
 if __name__ == "__main__":
-    # Fetch data (Change limit_days=5 or 10 if you want a fast validation run)
+    # Fetch 1 year of historical data. (For debugging/quick speed tests, drop limit_days to 10 or 30)
     df = fetch_binance_1m_data(symbol="SOLUSDT", limit_days=365)
     
-    # Execute Backtest starting with $10,000 cash and 0.075% taker fee/commission
-    bt = Backtest(df, SolEmaSmaStrategy, cash=10000, commission=0.00075, hedging=False, exclusive_orders=True)
+    # Initialize the backtest engine matching Binance futures parameters
+    bt = Backtest(
+        df, 
+        SolEmaSmaStrategy, 
+        cash=10000, 
+        commission=0.00075,  # 0.075% standard VIP0 Taker fee scaling
+        hedging=False, 
+        exclusive_orders=True
+    )
+    
+    # Run the backtest simulation
     stats = bt.run()
     
-    # Print Exact Requested Metrics
+    # Print clean strategy metrics summary
     print("\n" + "="*40)
     print("             BACKTEST METRICS            ")
     print("="*40)
@@ -145,12 +165,12 @@ if __name__ == "__main__":
     print(f"Max Drawdown (%)   : {stats['Max. Drawdown [%]']:.2f}%")
     print("="*40)
     
-    # Print individual historical trade list with absolute P&L breakdown
+    # Print detailed execution audit log
     print("\n--- Trade Execution Log (Buy Only) ---")
     trades = stats['_trades']
     if not trades.empty:
-        # Fixed: backtesting.py native column handles absolute PnL natively via 'PnL' column
         pd.set_option('display.max_rows', 100)
+        # Uses standard internal native fields 'PnL' and 'ReturnPct' to avoid formatting exceptions
         print(trades[['EntryTime', 'ExitTime', 'EntryPrice', 'ExitPrice', 'PnL', 'ReturnPct']])
     else:
         print("No completed trades matched your strategy's entry execution rules.")
