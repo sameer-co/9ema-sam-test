@@ -40,7 +40,7 @@ def fetch_binance_1m_data(symbol="SOLUSDT", limit_days=365):
     while current_start < end_time:
         params = {
             "symbol": symbol,
-            "interval": "1m",
+            "interval": "5m",
             "startTime": current_start,
             "endTime": end_time,
             "limit": 1000
@@ -86,7 +86,7 @@ def fetch_binance_1m_data(symbol="SOLUSDT", limit_days=365):
 # =====================================================================
 class SolEmaSmaStrategy(Strategy):
     def init(self):
-        close_series = pd.Series(self.data.Close.s)
+        close_series = pd.Self.colon(self.data.Close.s)
         self.ema9 = self.I(compute_ema, close_series, 9)
         self.sma9_of_ema = self.I(compute_sma_of_ema, close_series, 9, 9)
 
