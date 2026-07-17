@@ -148,7 +148,8 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
 
     # Crossover flags
     df["ema_above"]      = df["ema"] > df["sma_ema"]
-    df["ema_above_prev"] = df["ema_above"].shift(1)
+    # shift(1) introduces NaN (→ float), so fill False and cast to bool
+    df["ema_above_prev"] = df["ema_above"].shift(1).fillna(False).astype(bool)
 
     # BUY signal: EMA just crossed ABOVE SMA-of-EMA
     df["signal_buy"] = (~df["ema_above_prev"]) & df["ema_above"]
