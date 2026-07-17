@@ -1,453 +1,402 @@
 """
-=============================================================
-  SOL/USDT  |  9 EMA × 9 SMA(EMA) Crossover Backtest
-  Timeframe  : 1-minute
-  Data       : Binance (1 year, auto-chunked)
-  Signal     : BUY when 9-EMA crosses above its 9-SMA
-  SL         : Below trigger-candle low + buffer
-  TP         : 2× SL distance  (Risk:Reward = 2:1)
-=============================================================
+╔══════════════════════════════════════════════════════════════╗
+║   SOL/USDT  |  9 EMA × 9 SMA(EMA)  |  LIVE SIGNAL TRACKER  ║
+║   Sends Telegram alerts on every signal + trade close        ║
+╚══════════════════════════════════════════════════════════════╝
 
-EDITABLE PARAMETERS — change anything in the CONFIG block below
+HOW IT WORKS:
+  1. Every 60 seconds fetches latest 1m candles from Binance
+  2. Recalculates 9 EMA and its 9-period SMA
+  3. Detects crossover → sends BUY SIGNAL alert on Telegram
+  4. Tracks the open trade for SL / TP hit on every tick
+  5. Sends TRADE CLOSED alert with P&L + running totals
+
+SETUP:
+  pip install requests pandas
+
+EDIT THE CONFIG BLOCK BELOW, THEN RUN:
+  python sol_live_tracker.py
 """
 
 # ─────────────────────── CONFIG ───────────────────────────── #
 
-SYMBOL          = "SOLUSDT"     # Binance symbol
-INTERVAL        = "1m"          # Candle timeframe
-LOOKBACK_DAYS   = 365           # Days of history to fetch
+SYMBOL         = "SOLUSDT"          # Binance pair
+INTERVAL       = "1m"               # Candle interval (keep 1m)
+WARMUP_CANDLES = 100                # Candles to fetch on startup (min: EMA+SMA period)
 
-EMA_PERIOD      = 9             # Period for the base EMA
-SMA_PERIOD      = 9             # Period for SMA applied ON TOP of the EMA
+EMA_PERIOD     = 9                  # Base EMA period
+SMA_PERIOD     = 9                  # SMA applied ON TOP of the EMA
 
-SL_BUFFER_PCT   = 0.20          # Buffer on SL distance (% of raw SL dist)
-RISK_REWARD     = 2.0           # TP = entry + SL_dist × RISK_REWARD
+SL_BUFFER_PCT  = 0.20               # Buffer % added to raw SL distance
+RISK_REWARD    = 2.0                # TP = entry + SL_dist × RISK_REWARD
 
 # ── Position Sizing ──────────────────────────────────────── #
-#
-#   RISK_MODE = "fixed"    → risk a flat USD amount every trade (realistic)
-#   RISK_MODE = "percent"  → risk % of current capital every trade (compounds)
-#
-RISK_MODE       = "fixed"       # "fixed" or "percent"
-RISK_FIXED_USD  = 100           # USD risked per trade  (used when RISK_MODE = "fixed")
-RISK_PCT        = 1.0           # % of capital risked   (used when RISK_MODE = "percent")
+RISK_MODE      = "fixed"            # "fixed" → flat USD | "percent" → % of capital
+RISK_FIXED_USD = 100                # USD risked per trade (if RISK_MODE = "fixed")
+RISK_PCT       = 1.0                # % of capital risked  (if RISK_MODE = "percent")
+CAPITAL        = 10_000             # Starting capital (used for % mode & display)
 
-CAPITAL         = 10_000        # Starting capital in USDT
+# ── Telegram ─────────────────────────────────────────────── #
+TG_BOT_TOKEN   = "8551296586:AAFX631OEnFIX0L1uVoc4Ysv3-KpTsqkqHA"
+TG_CHAT_IDS    = ["1950462171"]     # Add more chat IDs if needed: ["id1", "id2"]
 
-# ── Output ───────────────────────────────────────────────── #
-PLOT_CHART       = True         # Show charts (requires matplotlib)
-SAVE_TRADES_CSV  = True         # Save trade log → trades_log.csv
-PRINT_EACH_TRADE = False        # Print every trade to console
+# ── Behaviour ────────────────────────────────────────────── #
+POLL_SECONDS   = 60                 # How often to check for new candle (seconds)
+SEND_STARTUP   = True               # Send a startup message when bot launches
+SAVE_LOG_CSV   = True               # Append each closed trade to trades_live.csv
 
 # ──────────────────────────────────────────────────────────── #
 
-import requests, time, math
+import requests
+import time
+import csv
+import os
 from datetime import datetime, timezone
+from dataclasses import dataclass, field
+from typing import Optional
 
-import numpy as np
 import pandas as pd
 
-try:
-    import matplotlib.pyplot as plt
-    import matplotlib.dates as mdates
-    import matplotlib.gridspec as gridspec
-    MPL_AVAILABLE = True
-except ImportError:
-    MPL_AVAILABLE = False
-    print("[WARN] matplotlib not installed — charts disabled. Run: pip install matplotlib")
+
+# ═══════════════════════ TELEGRAM ══════════════════════════════
+
+TG_API = f"https://api.telegram.org/bot{TG_BOT_TOKEN}"
+
+def tg_send(text: str, silent: bool = False):
+    """Send a message to all configured Telegram chat IDs."""
+    for chat_id in TG_CHAT_IDS:
+        try:
+            resp = requests.post(
+                f"{TG_API}/sendMessage",
+                json={
+                    "chat_id": chat_id,
+                    "text": text,
+                    "parse_mode": "HTML",
+                    "disable_notification": silent,
+                },
+                timeout=10,
+            )
+            if not resp.ok:
+                print(f"  [TG WARN] {resp.status_code} → {resp.text[:120]}")
+        except Exception as e:
+            print(f"  [TG ERROR] {e}")
 
 
-# ═══════════════════════ DATA FETCH ═══════════════════════════
+# ═══════════════════════ DATA FETCH ════════════════════════════
 
 BINANCE_BASE = "https://api.binance.com"
 
-def fetch_klines_chunk(symbol, interval, start_ms, end_ms, limit=1000):
+def fetch_candles(symbol: str, interval: str, limit: int) -> pd.DataFrame:
+    """Fetch the latest `limit` candles from Binance."""
     url = f"{BINANCE_BASE}/api/v3/klines"
-    params = dict(symbol=symbol, interval=interval,
-                  startTime=start_ms, endTime=end_ms, limit=limit)
-    resp = requests.get(url, params=params, timeout=15)
+    resp = requests.get(
+        url,
+        params={"symbol": symbol, "interval": interval, "limit": limit},
+        timeout=10,
+    )
     resp.raise_for_status()
-    return resp.json()
-
-
-def fetch_all_klines(symbol, interval, days):
-    end_ms   = int(datetime.now(timezone.utc).timestamp() * 1000)
-    start_ms = end_ms - days * 24 * 3600 * 1000
-
-    interval_ms = {
-        "1m": 60_000, "3m": 180_000, "5m": 300_000,
-        "15m": 900_000, "30m": 1_800_000, "1h": 3_600_000,
-    }[interval]
-
-    total_candles = (end_ms - start_ms) // interval_ms
-    num_chunks    = math.ceil(total_candles / 1000)
-
-    print(f"\n{'='*60}")
-    print(f"  Symbol   : {symbol}")
-    print(f"  Interval : {interval}")
-    print(f"  Period   : {days} days  (~{total_candles:,} candles)")
-    print(f"  Requests : {num_chunks} API calls needed")
-    print(f"{'='*60}\n")
-
-    all_rows  = []
-    cur_start = start_ms
-    chunk     = 0
-
-    while cur_start < end_ms:
-        chunk += 1
-        pct = chunk / num_chunks * 100
-        print(f"\r  Downloading... {pct:5.1f}%  ({chunk}/{num_chunks})", end="", flush=True)
-
-        rows = fetch_klines_chunk(symbol, interval, cur_start, end_ms, limit=1000)
-        if not rows:
-            break
-
-        all_rows.extend(rows)
-        cur_start = rows[-1][0] + interval_ms
-
-        if chunk % 10 == 0:
-            time.sleep(0.1)
-
-    print(f"\r  Downloaded {len(all_rows):,} candles total.{' '*30}")
+    raw = resp.json()
 
     cols = ["open_time","open","high","low","close","volume",
             "close_time","qav","num_trades","tbbav","tbqav","ignore"]
-    df = pd.DataFrame(all_rows, columns=cols)
+    df = pd.DataFrame(raw, columns=cols)
     df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
-    for c in ["open","high","low","close","volume"]:
+    for c in ["open","high","low","close"]:
         df[c] = df[c].astype(float)
-    df = df.drop_duplicates("open_time").sort_values("open_time").reset_index(drop=True)
-    return df
+    return df.reset_index(drop=True)
 
 
 # ═══════════════════════ INDICATORS ════════════════════════════
 
-def calc_ema(series: pd.Series, period: int) -> pd.Series:
-    return series.ewm(span=period, adjust=False).mean()
-
-def calc_sma(series: pd.Series, period: int) -> pd.Series:
-    return series.rolling(window=period).mean()
-
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    df["ema"]     = calc_ema(df["close"], EMA_PERIOD)
-    df["sma_ema"] = calc_sma(df["ema"], SMA_PERIOD)
-
-    df["ema_above"]      = df["ema"] > df["sma_ema"]
-    # shift(1) produces NaN on first row → fill False, cast to bool
+    df["ema"]          = df["close"].ewm(span=EMA_PERIOD, adjust=False).mean()
+    df["sma_ema"]      = df["ema"].rolling(SMA_PERIOD).mean()
+    df["ema_above"]    = df["ema"] > df["sma_ema"]
     df["ema_above_prev"] = df["ema_above"].shift(1).fillna(False).astype(bool)
-
-    # BUY: EMA just crossed ABOVE its SMA
-    df["signal_buy"] = (~df["ema_above_prev"]) & df["ema_above"]
+    df["signal_buy"]   = (~df["ema_above_prev"]) & df["ema_above"]
     return df
 
 
-# ════════════════════════ BACKTEST ═════════════════════════════
+# ═══════════════════════ STATE ═════════════════════════════════
 
-def run_backtest(df: pd.DataFrame):
-    warmup  = EMA_PERIOD + SMA_PERIOD + 5
-    trades  = []
-    capital = float(CAPITAL)
+@dataclass
+class Trade:
+    entry_time  : str
+    entry       : float
+    sl          : float
+    tp          : float
+    sl_dist     : float
+    risk_usd    : float
+    qty         : float
+    trigger_low : float
 
-    for i in range(warmup, len(df) - 2):
-        if not df.at[i, "signal_buy"]:
-            continue
+@dataclass
+class Stats:
+    total   : int   = 0
+    wins    : int   = 0
+    losses  : int   = 0
+    net_pnl : float = 0.0
+    capital : float = CAPITAL
 
-        trigger = df.iloc[i]
-        entry_c = df.iloc[i + 1]
+    @property
+    def win_rate(self) -> float:
+        return self.wins / self.total * 100 if self.total else 0.0
 
-        entry    = entry_c["open"]
-        trig_low = trigger["low"]
-
-        raw_sl_dist = entry - trig_low
-        if raw_sl_dist <= 0:
-            continue
-
-        # SL with buffer
-        sl_dist = raw_sl_dist * (1 + SL_BUFFER_PCT / 100)
-        sl      = entry - sl_dist
-        tp      = entry + sl_dist * RISK_REWARD
-
-        # ── Position sizing ──────────────────────────────────
-        if RISK_MODE == "fixed":
-            risk_usd = RISK_FIXED_USD                       # flat $100 every trade
-        else:
-            risk_usd = capital * (RISK_PCT / 100)           # % of current capital
-
-        qty = risk_usd / sl_dist                            # SOL units
-
-        # ── Scan for exit ────────────────────────────────────
-        exit_price = exit_reason = exit_idx = None
-        for j in range(i + 2, len(df)):
-            c = df.iloc[j]
-            if c["low"] <= sl:
-                exit_price, exit_reason, exit_idx = sl, "SL", j
-                break
-            if c["high"] >= tp:
-                exit_price, exit_reason, exit_idx = tp, "TP", j
-                break
-
-        if exit_price is None:
-            continue    # still open at end of data
-
-        pnl_usd  = (exit_price - entry) * qty
-        pnl_r    = pnl_usd / risk_usd
-        capital += pnl_usd
-
-        trade = {
-            "entry_time" : entry_c["open_time"].strftime("%Y-%m-%d %H:%M"),
-            "exit_time"  : df.iloc[exit_idx]["open_time"].strftime("%Y-%m-%d %H:%M"),
-            "entry"      : round(entry, 4),
-            "sl"         : round(sl, 4),
-            "tp"         : round(tp, 4),
-            "exit_price" : round(exit_price, 4),
-            "sl_dist"    : round(sl_dist, 4),
-            "qty"        : round(qty, 4),
-            "risk_usd"   : round(risk_usd, 2),
-            "pnl_usd"    : round(pnl_usd, 2),
-            "pnl_r"      : round(pnl_r, 3),
-            "result"     : exit_reason,
-            "capital"    : round(capital, 2),
-        }
-        trades.append(trade)
-
-        if PRINT_EACH_TRADE:
-            print(f"  {trade['entry_time']}  {exit_reason}  "
-                  f"Entry ${entry:.3f}  SL ${sl:.3f}  TP ${tp:.3f}  "
-                  f"Exit ${exit_price:.3f}  {pnl_r:+.2f}R / ${pnl_usd:+.2f}")
-
-    return pd.DataFrame(trades), capital
+    @property
+    def net_r(self) -> float:
+        return self.wins * RISK_REWARD - self.losses * 1.0
 
 
-# ════════════════════════ STATISTICS ═══════════════════════════
+# ═══════════════════════ ALERTS ════════════════════════════════
 
-def print_stats(trades: pd.DataFrame, final_capital: float):
-    if trades.empty:
-        print("\n  No completed trades found in this period.\n")
-        return
+def fmt_time() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
-    wins   = trades[trades["result"] == "TP"]
-    losses = trades[trades["result"] == "SL"]
-
-    total     = len(trades)
-    win_count = len(wins)
-    win_rate  = win_count / total * 100
-
-    gross_win  = wins["pnl_usd"].sum()
-    gross_loss = abs(losses["pnl_usd"].sum())
-    net_pnl    = trades["pnl_usd"].sum()
-    net_r      = trades["pnl_r"].sum()
-
-    pf = gross_win / gross_loss if gross_loss > 0 else float("inf")
-
-    avg_win_usd  = wins["pnl_usd"].mean()   if not wins.empty   else 0
-    avg_loss_usd = losses["pnl_usd"].mean() if not losses.empty else 0
-    avg_win_r    = wins["pnl_r"].mean()     if not wins.empty   else 0
-    avg_loss_r   = losses["pnl_r"].mean()   if not losses.empty else 0
-
-    # Expectancy per trade
-    expectancy_r   = (win_rate/100 * avg_win_r) + ((1 - win_rate/100) * avg_loss_r)
-    expectancy_usd = (win_rate/100 * avg_win_usd) + ((1 - win_rate/100) * avg_loss_usd)
-
-    # Max drawdown on capital curve
-    cap_curve = [CAPITAL] + list(trades["capital"])
-    peak, max_dd = cap_curve[0], 0.0
-    for c in cap_curve:
-        if c > peak:
-            peak = c
-        dd = (peak - c) / peak * 100
-        if dd > max_dd:
-            max_dd = dd
-
-    # Max consecutive losses
-    streak, max_streak = 0, 0
-    for r in trades["result"]:
-        if r == "SL":
-            streak += 1
-            max_streak = max(max_streak, streak)
-        else:
-            streak = 0
-
-    # Breakeven win rate for this R:R
-    breakeven_wr = 1 / (1 + RISK_REWARD) * 100
-
-    risk_label = (f"${RISK_FIXED_USD} fixed per trade"
-                  if RISK_MODE == "fixed"
-                  else f"{RISK_PCT}% of capital (compounding)")
-
-    sep = "─" * 54
-    print(f"\n{'═'*54}")
-    print(f"  BACKTEST RESULTS  —  {SYMBOL}  {INTERVAL}")
-    print(f"{'═'*54}")
-    print(f"  Strategy        :  {EMA_PERIOD} EMA × {SMA_PERIOD} SMA(EMA) crossover")
-    print(f"  SL Buffer       :  {SL_BUFFER_PCT}% of SL distance")
-    print(f"  Risk : Reward   :  1 : {RISK_REWARD}")
-    print(f"  Risk / Trade    :  {risk_label}")
-    print(f"{sep}")
-    print(f"  Total Trades    :  {total:,}")
-    print(f"  Wins / Losses   :  {win_count:,} / {len(losses):,}")
-    print(f"  Win Rate        :  {win_rate:.1f}%  (breakeven: {breakeven_wr:.1f}%)")
-    print(f"{sep}")
-    print(f"  Net P&L (USD)   :  ${net_pnl:+,.2f}")
-    print(f"  Net P&L (R)     :  {net_r:+.2f} R")
-    print(f"  Profit Factor   :  {pf:.3f}")
-    print(f"  Return on Cap   :  {(final_capital - CAPITAL) / CAPITAL * 100:+.2f}%")
-    print(f"{sep}")
-    print(f"  Avg Win         :  ${avg_win_usd:+,.2f}  /  {avg_win_r:+.3f} R")
-    print(f"  Avg Loss        :  ${avg_loss_usd:+,.2f}  /  {avg_loss_r:+.3f} R")
-    print(f"  Expectancy/Trade:  ${expectancy_usd:+,.2f}  /  {expectancy_r:+.4f} R")
-    print(f"  Max Drawdown    :  {max_dd:.2f}%")
-    print(f"  Max Consec Loss :  {max_streak}")
-    print(f"{sep}")
-    print(f"  Start Capital   :  ${CAPITAL:,.2f}")
-    print(f"  End Capital     :  ${final_capital:,.2f}")
-    print(f"{'═'*54}\n")
-
-    # Quick health check
-    print("  HEALTH CHECK:")
-    print(f"    Win rate {win_rate:.1f}% vs breakeven {breakeven_wr:.1f}% → "
-          + ("✓ Above breakeven" if win_rate > breakeven_wr else "✗ Below breakeven"))
-    print(f"    Profit Factor {pf:.3f} → "
-          + ("✓ Positive edge" if pf > 1 else "✗ Losing edge"))
-    print(f"    Expectancy {expectancy_r:+.4f} R/trade → "
-          + ("✓ Positive" if expectancy_r > 0 else "✗ Negative"))
-    print(f"    Max Drawdown {max_dd:.1f}% → "
-          + ("✓ Manageable" if max_dd < 30 else "⚠ High — review position sizing"))
-    print()
-
-
-# ════════════════════════ CHARTS ═══════════════════════════════
-
-def plot_results(df: pd.DataFrame, trades: pd.DataFrame):
-    if not MPL_AVAILABLE or not PLOT_CHART:
-        return
-    if trades.empty:
-        print("  [INFO] No trades to plot.")
-        return
-
-    fig = plt.figure(figsize=(16, 14), facecolor="#0e1117")
-    gs  = gridspec.GridSpec(3, 2, figure=fig, hspace=0.50, wspace=0.30)
-
-    ax_price = fig.add_subplot(gs[0, :])
-    ax_pnl   = fig.add_subplot(gs[1, :])
-    ax_dist  = fig.add_subplot(gs[2, 0])
-    ax_dd    = fig.add_subplot(gs[2, 1])
-
-    clr = {
-        "bg"    : "#0e1117", "fg"   : "#e0e0e0", "grid" : "#1e2533",
-        "price" : "#4a90d9", "ema"  : "#f0c040", "sma"  : "#e07090",
-        "win"   : "#2ecc71", "loss" : "#e74c3c", "pnl"  : "#3498db",
-        "dd"    : "#e74c3c",
-    }
-
-    def style_ax(ax):
-        ax.set_facecolor(clr["bg"])
-        ax.tick_params(colors=clr["fg"], labelsize=8)
-        ax.xaxis.label.set_color(clr["fg"])
-        ax.yaxis.label.set_color(clr["fg"])
-        ax.title.set_color(clr["fg"])
-        for spine in ax.spines.values():
-            spine.set_edgecolor(clr["grid"])
-        ax.grid(True, color=clr["grid"], linewidth=0.5, alpha=0.7)
-
-    # ── Price + Indicators (last 2000 candles) ──────────────
-    tail = df.tail(2000).copy()
-    ax_price.plot(tail["open_time"], tail["close"],   color=clr["price"], lw=0.6, label="Close", alpha=0.7)
-    ax_price.plot(tail["open_time"], tail["ema"],     color=clr["ema"],   lw=1.3, label=f"{EMA_PERIOD} EMA")
-    ax_price.plot(tail["open_time"], tail["sma_ema"], color=clr["sma"],   lw=1.3, label=f"{SMA_PERIOD} SMA(EMA)", linestyle="--")
-    sig_tail = tail[tail["signal_buy"]]
-    if not sig_tail.empty:
-        ax_price.scatter(sig_tail["open_time"], sig_tail["close"],
-                         marker="^", color=clr["win"], s=20, zorder=5, alpha=0.75, label="Signal")
-    ax_price.set_title(f"{SYMBOL} {INTERVAL} — Price & Indicators (last 2000 candles)", fontsize=10)
-    ax_price.set_ylabel("Price (USDT)", fontsize=8)
-    ax_price.legend(fontsize=7, facecolor="#1a1f2e", labelcolor=clr["fg"])
-    ax_price.xaxis.set_major_formatter(mdates.DateFormatter("%b %d"))
-    style_ax(ax_price)
-
-    # ── Cumulative P&L ──────────────────────────────────────
-    cum = trades["pnl_usd"].cumsum()
-    ax_pnl.plot(range(len(trades)), cum, color=clr["pnl"], lw=1.5)
-    ax_pnl.fill_between(range(len(trades)), 0, cum,
-                         where=cum >= 0, alpha=0.15, color=clr["win"])
-    ax_pnl.fill_between(range(len(trades)), 0, cum,
-                         where=cum <  0, alpha=0.15, color=clr["loss"])
-    ax_pnl.axhline(0, color=clr["fg"], lw=0.5, linestyle="--", alpha=0.4)
-    risk_label_short = (f"Fixed ${RISK_FIXED_USD}/trade"
-                        if RISK_MODE == "fixed" else f"{RISK_PCT}% compounding")
-    ax_pnl.set_title(f"Cumulative P&L (USD)  —  {risk_label_short}", fontsize=10)
-    ax_pnl.set_xlabel("Trade #", fontsize=8)
-    ax_pnl.set_ylabel("USD", fontsize=8)
-    style_ax(ax_pnl)
-
-    # ── Individual trade P&L bars ────────────────────────────
-    pnl_vals   = trades["pnl_usd"].values
-    bar_colors = [clr["win"] if v >= 0 else clr["loss"] for v in pnl_vals]
-    ax_dist.bar(range(len(pnl_vals)), pnl_vals, color=bar_colors, width=0.8, alpha=0.85)
-    ax_dist.axhline(0, color=clr["fg"], lw=0.5, linestyle="--", alpha=0.4)
-    ax_dist.set_title("Individual Trade P&L (USD)", fontsize=10)
-    ax_dist.set_xlabel("Trade #", fontsize=8)
-    ax_dist.set_ylabel("USD", fontsize=8)
-    style_ax(ax_dist)
-
-    # ── Drawdown curve ───────────────────────────────────────
-    cap_curve = [CAPITAL] + list(trades["capital"].values)
-    peak, dd_pct = cap_curve[0], []
-    for c in cap_curve[1:]:
-        if c > peak:
-            peak = c
-        dd_pct.append((peak - c) / peak * 100)
-    ax_dd.fill_between(range(len(dd_pct)), 0, [-d for d in dd_pct],
-                        color=clr["dd"], alpha=0.5)
-    ax_dd.plot(range(len(dd_pct)), [-d for d in dd_pct], color=clr["dd"], lw=1.2)
-    ax_dd.set_title("Drawdown (%)", fontsize=10)
-    ax_dd.set_xlabel("Trade #", fontsize=8)
-    ax_dd.set_ylabel("%", fontsize=8)
-    style_ax(ax_dd)
-
-    fig.suptitle(
-        f"9 EMA × 9 SMA(EMA) Backtest  |  {SYMBOL} {INTERVAL}  |  "
-        f"RR {RISK_REWARD}:1  |  SL buf {SL_BUFFER_PCT}%  |  {risk_label_short}",
-        color=clr["fg"], fontsize=10, y=0.99
+def alert_startup(stats: Stats):
+    msg = (
+        "🚀 <b>SOL/USDT Live Signal Bot Started</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"📊 Strategy  : {EMA_PERIOD} EMA × {SMA_PERIOD} SMA(EMA)\n"
+        f"⏱ Timeframe : {INTERVAL}\n"
+        f"🎯 R:R       : 1 : {RISK_REWARD}\n"
+        f"🛡 SL Buffer : {SL_BUFFER_PCT}%\n"
+        f"💰 Risk/Trade: "
+        + (f"${RISK_FIXED_USD} fixed" if RISK_MODE == "fixed" else f"{RISK_PCT}% of capital")
+        + f"\n⏰ Started   : {fmt_time()}\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "Watching for crossover signals..."
     )
-
-    plt.savefig("backtest_chart.png", dpi=150, bbox_inches="tight", facecolor=clr["bg"])
-    print("  Chart saved → backtest_chart.png")
-    plt.show()
+    tg_send(msg)
 
 
-# ════════════════════════ SAVE CSV ═════════════════════════════
+def alert_signal(trade: Trade, stats: Stats):
+    msg = (
+        "🟢 <b>BUY SIGNAL — SOLUSDT 1m</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"⏰ Time     : {trade.entry_time}\n"
+        f"📈 Entry    : <b>${trade.entry:.4f}</b>\n"
+        f"🛑 SL       : ${trade.sl:.4f}  "
+        f"({((trade.entry - trade.sl) / trade.entry * 100):.3f}% below)\n"
+        f"🎯 TP       : ${trade.tp:.4f}  "
+        f"({((trade.tp - trade.entry) / trade.entry * 100):.3f}% above)\n"
+        f"📐 SL Dist  : ${trade.sl_dist:.4f}\n"
+        f"💲 Risk     : ${trade.risk_usd:.2f}\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"📊 Session  : {stats.total} trades  "
+        f"| {stats.wins}W / {stats.losses}L"
+    )
+    tg_send(msg)
 
-def save_csv(trades: pd.DataFrame):
-    if not SAVE_TRADES_CSV or trades.empty:
+
+def alert_trade_closed(trade: Trade, exit_price: float,
+                        exit_reason: str, pnl_usd: float,
+                        pnl_r: float, stats: Stats):
+    emoji  = "✅" if exit_reason == "TP" else "❌"
+    result = "WIN  (TP HIT)" if exit_reason == "TP" else "LOSS (SL HIT)"
+    pnl_sign = "+" if pnl_usd >= 0 else ""
+
+    msg = (
+        f"{emoji} <b>TRADE CLOSED — {result}</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"⏰ Closed   : {fmt_time()}\n"
+        f"📈 Entry    : ${trade.entry:.4f}\n"
+        f"📉 Exit     : ${exit_price:.4f}\n"
+        f"💵 P&L      : <b>{pnl_sign}${pnl_usd:.2f}  ({pnl_sign}{pnl_r:.2f}R)</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"📊 <b>Running Stats</b>\n"
+        f"   Total Trades : {stats.total}\n"
+        f"   Wins / Losses: {stats.wins} / {stats.losses}\n"
+        f"   Win Rate     : {stats.win_rate:.1f}%\n"
+        f"   Net P&L      : {'+' if stats.net_pnl >= 0 else ''}${stats.net_pnl:.2f}\n"
+        f"   Net R        : {'+' if stats.net_r >= 0 else ''}{stats.net_r:.1f} R\n"
+        f"   Capital      : ${stats.capital:.2f}"
+    )
+    tg_send(msg)
+
+
+# ═══════════════════════ CSV LOG ═══════════════════════════════
+
+CSV_PATH = "trades_live.csv"
+CSV_HEADERS = [
+    "entry_time","exit_time","entry","sl","tp","exit_price",
+    "sl_dist","qty","risk_usd","pnl_usd","pnl_r","result","capital"
+]
+
+def log_trade_csv(trade: Trade, exit_price: float, exit_reason: str,
+                  pnl_usd: float, pnl_r: float, capital: float):
+    if not SAVE_LOG_CSV:
         return
-    path = "trades_log.csv"
-    trades.to_csv(path, index=False)
-    print(f"  Trade log saved → {path}")
+    write_header = not os.path.exists(CSV_PATH)
+    with open(CSV_PATH, "a", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=CSV_HEADERS)
+        if write_header:
+            w.writeheader()
+        w.writerow({
+            "entry_time"  : trade.entry_time,
+            "exit_time"   : fmt_time(),
+            "entry"       : round(trade.entry, 4),
+            "sl"          : round(trade.sl, 4),
+            "tp"          : round(trade.tp, 4),
+            "exit_price"  : round(exit_price, 4),
+            "sl_dist"     : round(trade.sl_dist, 4),
+            "qty"         : round(trade.qty, 4),
+            "risk_usd"    : round(trade.risk_usd, 2),
+            "pnl_usd"     : round(pnl_usd, 2),
+            "pnl_r"       : round(pnl_r, 3),
+            "result"      : exit_reason,
+            "capital"     : round(capital, 2),
+        })
 
 
-# ════════════════════════ MAIN ═════════════════════════════════
+# ═══════════════════════ MAIN LOOP ═════════════════════════════
+
+def compute_risk(capital: float) -> float:
+    if RISK_MODE == "fixed":
+        return RISK_FIXED_USD
+    return capital * (RISK_PCT / 100)
+
 
 def main():
-    print("\n  SOL/USDT  9 EMA × 9 SMA(EMA) Crossover Backtester")
-    print("  " + "─" * 50)
+    print("╔══════════════════════════════════════════════╗")
+    print("║  SOL/USDT  9EMA × 9SMA(EMA)  Live Tracker   ║")
+    print("╚══════════════════════════════════════════════╝")
+    print(f"  Telegram chat(s) : {TG_CHAT_IDS}")
+    print(f"  Risk mode        : {RISK_MODE}")
+    print(f"  Poll interval    : {POLL_SECONDS}s\n")
 
-    df = fetch_all_klines(SYMBOL, INTERVAL, LOOKBACK_DAYS)
-    print(f"  Date range : {df['open_time'].iloc[0].strftime('%Y-%m-%d')} "
-          f"→ {df['open_time'].iloc[-1].strftime('%Y-%m-%d')}")
+    stats        : Stats         = Stats()
+    open_trade   : Optional[Trade] = None
+    last_candle_time              = None  # track last processed candle
 
-    print("\n  Computing indicators...")
-    df = add_indicators(df)
-    print(f"  Crossover signals found : {df['signal_buy'].sum():,}")
+    # Send startup ping
+    if SEND_STARTUP:
+        print("  Sending startup message to Telegram...")
+        alert_startup(stats)
+        print("  ✓ Startup message sent.\n")
 
-    print("\n  Running backtest...\n")
-    trades, final_capital = run_backtest(df)
+    print("  Entering live loop. Press Ctrl+C to stop.\n")
 
-    print_stats(trades, final_capital)
-    save_csv(trades)
-    plot_results(df, trades)
+    while True:
+        try:
+            # ── 1. Fetch latest candles ──────────────────────
+            needed = max(WARMUP_CANDLES, EMA_PERIOD + SMA_PERIOD + 10)
+            df = fetch_candles(SYMBOL, INTERVAL, needed)
+            df = add_indicators(df)
 
-    print("  Done.\n")
+            # Use the LAST CLOSED candle (second to last row — last may still be forming)
+            closed = df.iloc[:-1].copy().reset_index(drop=True)
+            latest = closed.iloc[-1]
+            candle_time = latest["open_time"]
+
+            # ── 2. Check open trade for SL / TP ─────────────
+            if open_trade is not None:
+                low  = latest["low"]
+                high = latest["high"]
+
+                exit_price = exit_reason = None
+
+                if low <= open_trade.sl:
+                    exit_price  = open_trade.sl
+                    exit_reason = "SL"
+                elif high >= open_trade.tp:
+                    exit_price  = open_trade.tp
+                    exit_reason = "TP"
+
+                if exit_reason:
+                    pnl_usd  = (exit_price - open_trade.entry) * open_trade.qty
+                    pnl_r    = pnl_usd / open_trade.risk_usd
+                    stats.total   += 1
+                    stats.net_pnl += pnl_usd
+                    stats.capital += pnl_usd
+                    if exit_reason == "TP":
+                        stats.wins += 1
+                    else:
+                        stats.losses += 1
+
+                    print(f"  [{fmt_time()}] Trade CLOSED → {exit_reason}  "
+                          f"P&L: {'+' if pnl_usd >= 0 else ''}${pnl_usd:.2f} "
+                          f"({'+' if pnl_r >= 0 else ''}{pnl_r:.2f}R)")
+
+                    alert_trade_closed(open_trade, exit_price, exit_reason,
+                                       pnl_usd, pnl_r, stats)
+                    log_trade_csv(open_trade, exit_price, exit_reason,
+                                  pnl_usd, pnl_r, stats.capital)
+                    open_trade = None
+
+            # ── 3. Skip if we already processed this candle ──
+            if candle_time == last_candle_time:
+                time.sleep(POLL_SECONDS)
+                continue
+            last_candle_time = candle_time
+
+            # ── 4. Check for new BUY signal ──────────────────
+            if open_trade is None and latest["signal_buy"]:
+                # Entry on NEXT candle open — which is the current (still-forming) candle
+                next_open = df.iloc[-1]["open"]    # current candle's open price
+                trig_low  = latest["low"]
+
+                raw_sl_dist = next_open - trig_low
+                if raw_sl_dist > 0:
+                    sl_dist  = raw_sl_dist * (1 + SL_BUFFER_PCT / 100)
+                    sl       = next_open - sl_dist
+                    tp       = next_open + sl_dist * RISK_REWARD
+                    risk_usd = compute_risk(stats.capital)
+                    qty      = risk_usd / sl_dist
+
+                    open_trade = Trade(
+                        entry_time  = fmt_time(),
+                        entry       = next_open,
+                        sl          = sl,
+                        tp          = tp,
+                        sl_dist     = sl_dist,
+                        risk_usd    = risk_usd,
+                        qty         = qty,
+                        trigger_low = trig_low,
+                    )
+
+                    print(f"  [{fmt_time()}] BUY SIGNAL  "
+                          f"Entry ${next_open:.4f}  SL ${sl:.4f}  TP ${tp:.4f}")
+                    alert_signal(open_trade, stats)
+
+            else:
+                ema_val  = latest["ema"]
+                sma_val  = latest["sma_ema"]
+                cur_px   = latest["close"]
+                in_trade = "IN TRADE" if open_trade else "watching"
+                print(f"  [{candle_time.strftime('%H:%M')}]  "
+                      f"Price ${cur_px:.3f}  "
+                      f"EMA {ema_val:.3f}  SMA {sma_val:.3f}  "
+                      f"| {in_trade}")
+
+        except KeyboardInterrupt:
+            print("\n\n  Stopped by user.")
+            summary = (
+                "🛑 <b>Live Bot Stopped</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"📊 Total Trades : {stats.total}\n"
+                f"✅ Wins         : {stats.wins}\n"
+                f"❌ Losses       : {stats.losses}\n"
+                f"📈 Win Rate     : {stats.win_rate:.1f}%\n"
+                f"💵 Net P&L      : {'+' if stats.net_pnl >= 0 else ''}${stats.net_pnl:.2f}\n"
+                f"📐 Net R        : {'+' if stats.net_r >= 0 else ''}{stats.net_r:.1f} R\n"
+                f"💰 Capital      : ${stats.capital:.2f}"
+            )
+            tg_send(summary)
+            print("  Final summary sent to Telegram. Goodbye.\n")
+            break
+
+        except requests.exceptions.RequestException as e:
+            print(f"  [NET ERROR] {e} — retrying in {POLL_SECONDS}s")
+            time.sleep(POLL_SECONDS)
+            continue
+
+        except Exception as e:
+            print(f"  [ERROR] {e}")
+            time.sleep(POLL_SECONDS)
+            continue
+
+        time.sleep(POLL_SECONDS)
 
 
 if __name__ == "__main__":
