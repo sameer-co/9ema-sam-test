@@ -13,32 +13,36 @@ EDITABLE PARAMETERS — change anything in the CONFIG block below
 
 # ─────────────────────── CONFIG ───────────────────────────── #
 
-SYMBOL          = "SOLUSDT"          # Binance symbol
-INTERVAL        = "1m"               # Candle timeframe (1m recommended)
-LOOKBACK_DAYS   = 365                # How many days of history to fetch
+SYMBOL          = "SOLUSDT"     # Binance symbol
+INTERVAL        = "1m"          # Candle timeframe
+LOOKBACK_DAYS   = 365           # Days of history to fetch
 
-EMA_PERIOD      = 9                  # Period for the base EMA
-SMA_PERIOD      = 9                  # Period for the SMA applied ON TOP of the EMA
+EMA_PERIOD      = 9             # Period for the base EMA
+SMA_PERIOD      = 9             # Period for SMA applied ON TOP of the EMA
 
-SL_BUFFER_PCT   = 0.20              # Buffer added to SL distance (% of raw SL dist)
-                                     # e.g. 0.20 = 0.20% of the raw SL distance
-RISK_REWARD     = 2.0               # Target = entry + (slDist × RISK_REWARD)
+SL_BUFFER_PCT   = 0.20          # Buffer on SL distance (% of raw SL dist)
+RISK_REWARD     = 2.0           # TP = entry + SL_dist × RISK_REWARD
 
-CAPITAL         = 10_000            # Starting capital in USDT
-RISK_PER_TRADE  = 1.0               # % of capital risked per trade
-                                     # Position size = (capital × RISK_PCT) / slDist
+# ── Position Sizing ──────────────────────────────────────── #
+#
+#   RISK_MODE = "fixed"    → risk a flat USD amount every trade (realistic)
+#   RISK_MODE = "percent"  → risk % of current capital every trade (compounds)
+#
+RISK_MODE       = "fixed"       # "fixed" or "percent"
+RISK_FIXED_USD  = 100           # USD risked per trade  (used when RISK_MODE = "fixed")
+RISK_PCT        = 1.0           # % of capital risked   (used when RISK_MODE = "percent")
 
-PLOT_CHART      = True              # Show charts after backtest
-SAVE_TRADES_CSV = True              # Save trade log to trades_log.csv
-PRINT_EACH_TRADE = False            # Print every trade to console (verbose)
+CAPITAL         = 10_000        # Starting capital in USDT
+
+# ── Output ───────────────────────────────────────────────── #
+PLOT_CHART       = True         # Show charts (requires matplotlib)
+SAVE_TRADES_CSV  = True         # Save trade log → trades_log.csv
+PRINT_EACH_TRADE = False        # Print every trade to console
 
 # ──────────────────────────────────────────────────────────── #
 
-import requests
-import time
-import math
-import csv
-from datetime import datetime, timedelta, timezone
+import requests, time, math
+from datetime import datetime, timezone
 
 import numpy as np
 import pandas as pd
@@ -58,29 +62,18 @@ except ImportError:
 BINANCE_BASE = "https://api.binance.com"
 
 def fetch_klines_chunk(symbol, interval, start_ms, end_ms, limit=1000):
-    """Fetch one chunk of klines from Binance."""
     url = f"{BINANCE_BASE}/api/v3/klines"
-    params = {
-        "symbol": symbol,
-        "interval": interval,
-        "startTime": start_ms,
-        "endTime": end_ms,
-        "limit": limit,
-    }
+    params = dict(symbol=symbol, interval=interval,
+                  startTime=start_ms, endTime=end_ms, limit=limit)
     resp = requests.get(url, params=params, timeout=15)
     resp.raise_for_status()
     return resp.json()
 
 
 def fetch_all_klines(symbol, interval, days):
-    """
-    Fetch all 1-minute candles for the past `days` days by chunking
-    into 1000-candle requests (Binance max per request).
-    """
     end_ms   = int(datetime.now(timezone.utc).timestamp() * 1000)
     start_ms = end_ms - days * 24 * 3600 * 1000
 
-    # Interval → milliseconds per candle
     interval_ms = {
         "1m": 60_000, "3m": 180_000, "5m": 300_000,
         "15m": 900_000, "30m": 1_800_000, "1h": 3_600_000,
@@ -96,9 +89,9 @@ def fetch_all_klines(symbol, interval, days):
     print(f"  Requests : {num_chunks} API calls needed")
     print(f"{'='*60}\n")
 
-    all_rows = []
+    all_rows  = []
     cur_start = start_ms
-    chunk = 0
+    chunk     = 0
 
     while cur_start < end_ms:
         chunk += 1
@@ -110,10 +103,8 @@ def fetch_all_klines(symbol, interval, days):
             break
 
         all_rows.extend(rows)
-        last_ts = rows[-1][0]
-        cur_start = last_ts + interval_ms
+        cur_start = rows[-1][0] + interval_ms
 
-        # Binance rate-limit: ~1200 req/min — stay safe with tiny sleep
         if chunk % 10 == 0:
             time.sleep(0.1)
 
@@ -132,108 +123,98 @@ def fetch_all_klines(symbol, interval, days):
 # ═══════════════════════ INDICATORS ════════════════════════════
 
 def calc_ema(series: pd.Series, period: int) -> pd.Series:
-    """Exponential Moving Average."""
     return series.ewm(span=period, adjust=False).mean()
 
-
 def calc_sma(series: pd.Series, period: int) -> pd.Series:
-    """Simple Moving Average."""
     return series.rolling(window=period).mean()
-
 
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df["ema"]     = calc_ema(df["close"], EMA_PERIOD)
     df["sma_ema"] = calc_sma(df["ema"], SMA_PERIOD)
 
-    # Crossover flags
     df["ema_above"]      = df["ema"] > df["sma_ema"]
-    # shift(1) introduces NaN (→ float), so fill False and cast to bool
+    # shift(1) produces NaN on first row → fill False, cast to bool
     df["ema_above_prev"] = df["ema_above"].shift(1).fillna(False).astype(bool)
 
-    # BUY signal: EMA just crossed ABOVE SMA-of-EMA
+    # BUY: EMA just crossed ABOVE its SMA
     df["signal_buy"] = (~df["ema_above_prev"]) & df["ema_above"]
-
     return df
 
 
 # ════════════════════════ BACKTEST ═════════════════════════════
 
 def run_backtest(df: pd.DataFrame):
-    warmup = EMA_PERIOD + SMA_PERIOD + 5   # skip until both indicators are valid
-    trades = []
-    capital = CAPITAL
+    warmup  = EMA_PERIOD + SMA_PERIOD + 5
+    trades  = []
+    capital = float(CAPITAL)
 
     for i in range(warmup, len(df) - 2):
         if not df.at[i, "signal_buy"]:
             continue
 
-        trigger_candle = df.iloc[i]
-        entry_candle   = df.iloc[i + 1]
+        trigger = df.iloc[i]
+        entry_c = df.iloc[i + 1]
 
-        entry = entry_candle["open"]
-        trig_low = trigger_candle["low"]
+        entry    = entry_c["open"]
+        trig_low = trigger["low"]
 
-        raw_sl_dist  = entry - trig_low
+        raw_sl_dist = entry - trig_low
         if raw_sl_dist <= 0:
             continue
 
-        # SL = trigger low moved down by buffer % of the raw distance
-        sl_dist  = raw_sl_dist * (1 + SL_BUFFER_PCT / 100)
-        sl       = entry - sl_dist
-        tp       = entry + sl_dist * RISK_REWARD
+        # SL with buffer
+        sl_dist = raw_sl_dist * (1 + SL_BUFFER_PCT / 100)
+        sl      = entry - sl_dist
+        tp      = entry + sl_dist * RISK_REWARD
 
-        # Position sizing
-        risk_usd = capital * (RISK_PER_TRADE / 100)
-        qty      = risk_usd / sl_dist          # units of SOL
+        # ── Position sizing ──────────────────────────────────
+        if RISK_MODE == "fixed":
+            risk_usd = RISK_FIXED_USD                       # flat $100 every trade
+        else:
+            risk_usd = capital * (RISK_PCT / 100)           # % of current capital
 
-        # Scan forward for TP / SL hit
-        exit_price  = None
-        exit_reason = None
-        exit_idx    = None
+        qty = risk_usd / sl_dist                            # SOL units
 
+        # ── Scan for exit ────────────────────────────────────
+        exit_price = exit_reason = exit_idx = None
         for j in range(i + 2, len(df)):
             c = df.iloc[j]
-            # Check SL first (conservative — worst case wick)
             if c["low"] <= sl:
-                exit_price  = sl
-                exit_reason = "SL"
-                exit_idx    = j
+                exit_price, exit_reason, exit_idx = sl, "SL", j
                 break
             if c["high"] >= tp:
-                exit_price  = tp
-                exit_reason = "TP"
-                exit_idx    = j
+                exit_price, exit_reason, exit_idx = tp, "TP", j
                 break
 
         if exit_price is None:
-            continue   # trade still open at end of data — skip
+            continue    # still open at end of data
 
-        pnl_usd = (exit_price - entry) * qty
-        pnl_r   = pnl_usd / risk_usd          # in R-multiples
+        pnl_usd  = (exit_price - entry) * qty
+        pnl_r    = pnl_usd / risk_usd
         capital += pnl_usd
 
         trade = {
-            "entry_time"  : entry_candle["open_time"].strftime("%Y-%m-%d %H:%M"),
-            "exit_time"   : df.iloc[exit_idx]["open_time"].strftime("%Y-%m-%d %H:%M"),
-            "entry"       : round(entry, 4),
-            "sl"          : round(sl, 4),
-            "tp"          : round(tp, 4),
-            "exit_price"  : round(exit_price, 4),
-            "sl_dist"     : round(sl_dist, 4),
-            "qty"         : round(qty, 4),
-            "risk_usd"    : round(risk_usd, 2),
-            "pnl_usd"     : round(pnl_usd, 2),
-            "pnl_r"       : round(pnl_r, 3),
-            "result"      : exit_reason,
-            "capital"     : round(capital, 2),
+            "entry_time" : entry_c["open_time"].strftime("%Y-%m-%d %H:%M"),
+            "exit_time"  : df.iloc[exit_idx]["open_time"].strftime("%Y-%m-%d %H:%M"),
+            "entry"      : round(entry, 4),
+            "sl"         : round(sl, 4),
+            "tp"         : round(tp, 4),
+            "exit_price" : round(exit_price, 4),
+            "sl_dist"    : round(sl_dist, 4),
+            "qty"        : round(qty, 4),
+            "risk_usd"   : round(risk_usd, 2),
+            "pnl_usd"    : round(pnl_usd, 2),
+            "pnl_r"      : round(pnl_r, 3),
+            "result"     : exit_reason,
+            "capital"    : round(capital, 2),
         }
         trades.append(trade)
 
         if PRINT_EACH_TRADE:
-            print(f"  {trade['entry_time']}  {exit_reason:2s}  "
+            print(f"  {trade['entry_time']}  {exit_reason}  "
                   f"Entry ${entry:.3f}  SL ${sl:.3f}  TP ${tp:.3f}  "
-                  f"Exit ${exit_price:.3f}  P&L {pnl_r:+.2f}R / ${pnl_usd:+.2f}")
+                  f"Exit ${exit_price:.3f}  {pnl_r:+.2f}R / ${pnl_usd:+.2f}")
 
     return pd.DataFrame(trades), capital
 
@@ -259,13 +240,18 @@ def print_stats(trades: pd.DataFrame, final_capital: float):
 
     pf = gross_win / gross_loss if gross_loss > 0 else float("inf")
 
-    avg_win_r  = wins["pnl_r"].mean()   if not wins.empty   else 0
-    avg_loss_r = losses["pnl_r"].mean() if not losses.empty else 0
+    avg_win_usd  = wins["pnl_usd"].mean()   if not wins.empty   else 0
+    avg_loss_usd = losses["pnl_usd"].mean() if not losses.empty else 0
+    avg_win_r    = wins["pnl_r"].mean()     if not wins.empty   else 0
+    avg_loss_r   = losses["pnl_r"].mean()   if not losses.empty else 0
 
-    # Max drawdown (in capital)
+    # Expectancy per trade
+    expectancy_r   = (win_rate/100 * avg_win_r) + ((1 - win_rate/100) * avg_loss_r)
+    expectancy_usd = (win_rate/100 * avg_win_usd) + ((1 - win_rate/100) * avg_loss_usd)
+
+    # Max drawdown on capital curve
     cap_curve = [CAPITAL] + list(trades["capital"])
-    peak = cap_curve[0]
-    max_dd = 0
+    peak, max_dd = cap_curve[0], 0.0
     for c in cap_curve:
         if c > peak:
             peak = c
@@ -274,8 +260,7 @@ def print_stats(trades: pd.DataFrame, final_capital: float):
             max_dd = dd
 
     # Max consecutive losses
-    streak = 0
-    max_streak = 0
+    streak, max_streak = 0, 0
     for r in trades["result"]:
         if r == "SL":
             streak += 1
@@ -283,32 +268,52 @@ def print_stats(trades: pd.DataFrame, final_capital: float):
         else:
             streak = 0
 
-    sep = "─" * 52
-    print(f"\n{'═'*52}")
+    # Breakeven win rate for this R:R
+    breakeven_wr = 1 / (1 + RISK_REWARD) * 100
+
+    risk_label = (f"${RISK_FIXED_USD} fixed per trade"
+                  if RISK_MODE == "fixed"
+                  else f"{RISK_PCT}% of capital (compounding)")
+
+    sep = "─" * 54
+    print(f"\n{'═'*54}")
     print(f"  BACKTEST RESULTS  —  {SYMBOL}  {INTERVAL}")
-    print(f"{'═'*52}")
-    print(f"  Strategy   :  {EMA_PERIOD} EMA × {SMA_PERIOD} SMA(EMA) crossover")
-    print(f"  SL Buffer  :  {SL_BUFFER_PCT}% of SL distance")
-    print(f"  R:R        :  1 : {RISK_REWARD}")
-    print(f"  Risk/Trade :  {RISK_PER_TRADE}% of capital")
+    print(f"{'═'*54}")
+    print(f"  Strategy        :  {EMA_PERIOD} EMA × {SMA_PERIOD} SMA(EMA) crossover")
+    print(f"  SL Buffer       :  {SL_BUFFER_PCT}% of SL distance")
+    print(f"  Risk : Reward   :  1 : {RISK_REWARD}")
+    print(f"  Risk / Trade    :  {risk_label}")
     print(f"{sep}")
-    print(f"  Total Trades      :  {total}")
-    print(f"  Wins / Losses     :  {win_count} / {len(losses)}")
-    print(f"  Win Rate          :  {win_rate:.1f}%")
+    print(f"  Total Trades    :  {total:,}")
+    print(f"  Wins / Losses   :  {win_count:,} / {len(losses):,}")
+    print(f"  Win Rate        :  {win_rate:.1f}%  (breakeven: {breakeven_wr:.1f}%)")
     print(f"{sep}")
-    print(f"  Net P&L (USD)     :  ${net_pnl:+,.2f}")
-    print(f"  Net P&L (R)       :  {net_r:+.2f} R")
-    print(f"  Profit Factor     :  {pf:.2f}")
-    print(f"  Return on Capital :  {(final_capital - CAPITAL) / CAPITAL * 100:+.2f}%")
+    print(f"  Net P&L (USD)   :  ${net_pnl:+,.2f}")
+    print(f"  Net P&L (R)     :  {net_r:+.2f} R")
+    print(f"  Profit Factor   :  {pf:.3f}")
+    print(f"  Return on Cap   :  {(final_capital - CAPITAL) / CAPITAL * 100:+.2f}%")
     print(f"{sep}")
-    print(f"  Avg Win (R)       :  {avg_win_r:+.3f} R")
-    print(f"  Avg Loss (R)      :  {avg_loss_r:+.3f} R")
-    print(f"  Max Drawdown      :  {max_dd:.2f}%")
-    print(f"  Max Consec Losses :  {max_streak}")
+    print(f"  Avg Win         :  ${avg_win_usd:+,.2f}  /  {avg_win_r:+.3f} R")
+    print(f"  Avg Loss        :  ${avg_loss_usd:+,.2f}  /  {avg_loss_r:+.3f} R")
+    print(f"  Expectancy/Trade:  ${expectancy_usd:+,.2f}  /  {expectancy_r:+.4f} R")
+    print(f"  Max Drawdown    :  {max_dd:.2f}%")
+    print(f"  Max Consec Loss :  {max_streak}")
     print(f"{sep}")
-    print(f"  Start Capital     :  ${CAPITAL:,.2f}")
-    print(f"  End Capital       :  ${final_capital:,.2f}")
-    print(f"{'═'*52}\n")
+    print(f"  Start Capital   :  ${CAPITAL:,.2f}")
+    print(f"  End Capital     :  ${final_capital:,.2f}")
+    print(f"{'═'*54}\n")
+
+    # Quick health check
+    print("  HEALTH CHECK:")
+    print(f"    Win rate {win_rate:.1f}% vs breakeven {breakeven_wr:.1f}% → "
+          + ("✓ Above breakeven" if win_rate > breakeven_wr else "✗ Below breakeven"))
+    print(f"    Profit Factor {pf:.3f} → "
+          + ("✓ Positive edge" if pf > 1 else "✗ Losing edge"))
+    print(f"    Expectancy {expectancy_r:+.4f} R/trade → "
+          + ("✓ Positive" if expectancy_r > 0 else "✗ Negative"))
+    print(f"    Max Drawdown {max_dd:.1f}% → "
+          + ("✓ Manageable" if max_dd < 30 else "⚠ High — review position sizing"))
+    print()
 
 
 # ════════════════════════ CHARTS ═══════════════════════════════
@@ -320,25 +325,19 @@ def plot_results(df: pd.DataFrame, trades: pd.DataFrame):
         print("  [INFO] No trades to plot.")
         return
 
-    fig = plt.figure(figsize=(16, 12), facecolor="#0e1117")
-    gs  = gridspec.GridSpec(3, 2, figure=fig, hspace=0.45, wspace=0.3)
+    fig = plt.figure(figsize=(16, 14), facecolor="#0e1117")
+    gs  = gridspec.GridSpec(3, 2, figure=fig, hspace=0.50, wspace=0.30)
 
-    ax_price = fig.add_subplot(gs[0, :])   # full width — price + EMA lines
-    ax_pnl   = fig.add_subplot(gs[1, :])   # cumulative P&L curve
-    ax_dist  = fig.add_subplot(gs[2, 0])   # win/loss distribution
-    ax_dd    = fig.add_subplot(gs[2, 1])   # drawdown curve
+    ax_price = fig.add_subplot(gs[0, :])
+    ax_pnl   = fig.add_subplot(gs[1, :])
+    ax_dist  = fig.add_subplot(gs[2, 0])
+    ax_dd    = fig.add_subplot(gs[2, 1])
 
     clr = {
-        "bg"     : "#0e1117",
-        "fg"     : "#e0e0e0",
-        "grid"   : "#1e2533",
-        "price"  : "#4a90d9",
-        "ema"    : "#f0c040",
-        "sma"    : "#e07090",
-        "win"    : "#2ecc71",
-        "loss"   : "#e74c3c",
-        "pnl"    : "#3498db",
-        "dd"     : "#e74c3c",
+        "bg"    : "#0e1117", "fg"   : "#e0e0e0", "grid" : "#1e2533",
+        "price" : "#4a90d9", "ema"  : "#f0c040", "sma"  : "#e07090",
+        "win"   : "#2ecc71", "loss" : "#e74c3c", "pnl"  : "#3498db",
+        "dd"    : "#e74c3c",
     }
 
     def style_ax(ax):
@@ -351,39 +350,38 @@ def plot_results(df: pd.DataFrame, trades: pd.DataFrame):
             spine.set_edgecolor(clr["grid"])
         ax.grid(True, color=clr["grid"], linewidth=0.5, alpha=0.7)
 
-    # ── Price + Indicators (last 2000 candles for readability) ──
+    # ── Price + Indicators (last 2000 candles) ──────────────
     tail = df.tail(2000).copy()
-    ax_price.plot(tail["open_time"], tail["close"],  color=clr["price"], lw=0.6, label="Close", alpha=0.7)
-    ax_price.plot(tail["open_time"], tail["ema"],    color=clr["ema"],   lw=1.2, label=f"{EMA_PERIOD} EMA")
-    ax_price.plot(tail["open_time"], tail["sma_ema"],color=clr["sma"],   lw=1.2, label=f"{SMA_PERIOD} SMA(EMA)", linestyle="--")
+    ax_price.plot(tail["open_time"], tail["close"],   color=clr["price"], lw=0.6, label="Close", alpha=0.7)
+    ax_price.plot(tail["open_time"], tail["ema"],     color=clr["ema"],   lw=1.3, label=f"{EMA_PERIOD} EMA")
+    ax_price.plot(tail["open_time"], tail["sma_ema"], color=clr["sma"],   lw=1.3, label=f"{SMA_PERIOD} SMA(EMA)", linestyle="--")
+    sig_tail = tail[tail["signal_buy"]]
+    if not sig_tail.empty:
+        ax_price.scatter(sig_tail["open_time"], sig_tail["close"],
+                         marker="^", color=clr["win"], s=20, zorder=5, alpha=0.75, label="Signal")
     ax_price.set_title(f"{SYMBOL} {INTERVAL} — Price & Indicators (last 2000 candles)", fontsize=10)
     ax_price.set_ylabel("Price (USDT)", fontsize=8)
     ax_price.legend(fontsize=7, facecolor="#1a1f2e", labelcolor=clr["fg"])
     ax_price.xaxis.set_major_formatter(mdates.DateFormatter("%b %d"))
     style_ax(ax_price)
 
-    # Mark buy signals on price chart
-    sig_in_tail = tail[tail["signal_buy"]]
-    if not sig_in_tail.empty:
-        ax_price.scatter(sig_in_tail["open_time"], sig_in_tail["close"],
-                         marker="^", color=clr["win"], s=25, zorder=5, label="Signal", alpha=0.8)
-
-    # ── Cumulative P&L curve ──
-    trades["cum_pnl"] = trades["pnl_usd"].cumsum()
-    colors_pnl = [clr["win"] if v >= 0 else clr["loss"] for v in trades["cum_pnl"]]
-    ax_pnl.plot(range(len(trades)), trades["cum_pnl"], color=clr["pnl"], lw=1.5)
-    ax_pnl.fill_between(range(len(trades)), 0, trades["cum_pnl"],
-                         where=trades["cum_pnl"] >= 0, alpha=0.15, color=clr["win"])
-    ax_pnl.fill_between(range(len(trades)), 0, trades["cum_pnl"],
-                         where=trades["cum_pnl"] < 0,  alpha=0.15, color=clr["loss"])
+    # ── Cumulative P&L ──────────────────────────────────────
+    cum = trades["pnl_usd"].cumsum()
+    ax_pnl.plot(range(len(trades)), cum, color=clr["pnl"], lw=1.5)
+    ax_pnl.fill_between(range(len(trades)), 0, cum,
+                         where=cum >= 0, alpha=0.15, color=clr["win"])
+    ax_pnl.fill_between(range(len(trades)), 0, cum,
+                         where=cum <  0, alpha=0.15, color=clr["loss"])
     ax_pnl.axhline(0, color=clr["fg"], lw=0.5, linestyle="--", alpha=0.4)
-    ax_pnl.set_title("Cumulative P&L (USD)", fontsize=10)
+    risk_label_short = (f"Fixed ${RISK_FIXED_USD}/trade"
+                        if RISK_MODE == "fixed" else f"{RISK_PCT}% compounding")
+    ax_pnl.set_title(f"Cumulative P&L (USD)  —  {risk_label_short}", fontsize=10)
     ax_pnl.set_xlabel("Trade #", fontsize=8)
     ax_pnl.set_ylabel("USD", fontsize=8)
     style_ax(ax_pnl)
 
-    # ── Win / Loss bar chart ──
-    pnl_vals = trades["pnl_usd"].values
+    # ── Individual trade P&L bars ────────────────────────────
+    pnl_vals   = trades["pnl_usd"].values
     bar_colors = [clr["win"] if v >= 0 else clr["loss"] for v in pnl_vals]
     ax_dist.bar(range(len(pnl_vals)), pnl_vals, color=bar_colors, width=0.8, alpha=0.85)
     ax_dist.axhline(0, color=clr["fg"], lw=0.5, linestyle="--", alpha=0.4)
@@ -392,16 +390,15 @@ def plot_results(df: pd.DataFrame, trades: pd.DataFrame):
     ax_dist.set_ylabel("USD", fontsize=8)
     style_ax(ax_dist)
 
-    # ── Drawdown curve ──
+    # ── Drawdown curve ───────────────────────────────────────
     cap_curve = [CAPITAL] + list(trades["capital"].values)
-    peak = cap_curve[0]
-    dd_pct = []
+    peak, dd_pct = cap_curve[0], []
     for c in cap_curve[1:]:
         if c > peak:
             peak = c
         dd_pct.append((peak - c) / peak * 100)
-
-    ax_dd.fill_between(range(len(dd_pct)), 0, [-d for d in dd_pct], color=clr["dd"], alpha=0.5)
+    ax_dd.fill_between(range(len(dd_pct)), 0, [-d for d in dd_pct],
+                        color=clr["dd"], alpha=0.5)
     ax_dd.plot(range(len(dd_pct)), [-d for d in dd_pct], color=clr["dd"], lw=1.2)
     ax_dd.set_title("Drawdown (%)", fontsize=10)
     ax_dd.set_xlabel("Trade #", fontsize=8)
@@ -410,8 +407,8 @@ def plot_results(df: pd.DataFrame, trades: pd.DataFrame):
 
     fig.suptitle(
         f"9 EMA × 9 SMA(EMA) Backtest  |  {SYMBOL} {INTERVAL}  |  "
-        f"RR {RISK_REWARD}:1  |  SL buffer {SL_BUFFER_PCT}%",
-        color=clr["fg"], fontsize=11, y=0.98
+        f"RR {RISK_REWARD}:1  |  SL buf {SL_BUFFER_PCT}%  |  {risk_label_short}",
+        color=clr["fg"], fontsize=10, y=0.99
     )
 
     plt.savefig("backtest_chart.png", dpi=150, bbox_inches="tight", facecolor=clr["bg"])
@@ -433,31 +430,21 @@ def save_csv(trades: pd.DataFrame):
 
 def main():
     print("\n  SOL/USDT  9 EMA × 9 SMA(EMA) Crossover Backtester")
-    print("  " + "─" * 48)
+    print("  " + "─" * 50)
 
-    # 1. Fetch data
     df = fetch_all_klines(SYMBOL, INTERVAL, LOOKBACK_DAYS)
-    print(f"  Date range: {df['open_time'].iloc[0].strftime('%Y-%m-%d')} "
+    print(f"  Date range : {df['open_time'].iloc[0].strftime('%Y-%m-%d')} "
           f"→ {df['open_time'].iloc[-1].strftime('%Y-%m-%d')}")
 
-    # 2. Add indicators
     print("\n  Computing indicators...")
     df = add_indicators(df)
+    print(f"  Crossover signals found : {df['signal_buy'].sum():,}")
 
-    signal_count = df["signal_buy"].sum()
-    print(f"  Crossover signals found: {signal_count}")
-
-    # 3. Run backtest
     print("\n  Running backtest...\n")
     trades, final_capital = run_backtest(df)
 
-    # 4. Print stats
     print_stats(trades, final_capital)
-
-    # 5. Save CSV
     save_csv(trades)
-
-    # 6. Plot charts
     plot_results(df, trades)
 
     print("  Done.\n")
